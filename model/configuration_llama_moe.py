@@ -22,11 +22,7 @@
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-
 logger = logging.get_logger(__name__)
-
-
-from ..deprecated._archive_maps import LLAMA_PRETRAINED_CONFIG_ARCHIVE_MAP  # noqa: F401, E402
 
 
 class LlamaMoEConfig(PretrainedConfig):
@@ -116,28 +112,34 @@ class LlamaMoEConfig(PretrainedConfig):
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
-        self,
-        vocab_size=32000,
-        hidden_size=4096,
-        intermediate_size=11008,
-        num_hidden_layers=32,
-        num_attention_heads=32,
-        num_key_value_heads=None,
-        hidden_act="silu",
-        max_position_embeddings=2048,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=1,
-        eos_token_id=2,
-        pretraining_tp=1,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        attention_bias=False,
-        attention_dropout=0.0,
-        **kwargs,
+            self,
+            attention_bias=False,
+            attention_dropout=0.0,
+            vocab_size=128256,
+            hidden_size=4096,
+            intermediate_size=14336,
+            num_hidden_layers=32,
+            expert_capacity=64,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            num_experts=8,
+            hidden_act="silu",
+            max_position_embeddings=8192,
+            initializer_range=0.02,
+            rms_norm_eps=1e-6,
+            use_cache=True,
+            pad_token_id=None,
+            bos_token_id=128000,
+            eos_token_id=128001,
+            pretraining_tp=1,
+            tie_word_embeddings=False,
+            torch_dtype="bfloat16",
+            rope_theta=10000.0,
+            rope_scaling=None,
+            router_bias=False,
+            router_jitter_noise=0.01,
+            router_ignore_padding_tokens=False,
+            **kwargs,
     ):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -145,7 +147,7 @@ class LlamaMoEConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
-
+        self.num_experts = num_experts
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
@@ -159,14 +161,19 @@ class LlamaMoEConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self._rope_scaling_validation()
+        self.router_bias = router_bias
+        self.router_jitter_noise = router_jitter_noise
+        self.router_ignore_padding_tokens = router_ignore_padding_tokens
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
-
+        self.expert_capacity = expert_capacity
+        self.torch_dtype = torch_dtype
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
+            torch_dtype=torch_dtype,
             **kwargs,
         )
 

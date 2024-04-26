@@ -4,122 +4,94 @@ import torch
 import os
 import pickle
 import random
-
+from torch import nn
 from tqdm import tqdm
 from transformers import LlamaForCausalLM
 
 from model.configuration_llama_moe import LlamaMoEConfig
 from model.modeling_llama_moe import LlamaMoEForCausalLM
 
-def random_split(config, layer):
-    config = config
-    layer = layer
-    neuron_num = config.intermediate_size
-    split_size = neuron_num // config.num_experts
-    labels = np.arange(0, config.num_experts, dtype=int).tolist()
-    labels = labels * split_size
-    random.shuffle(labels)
+
+def random_split(config):
+    neuron_total = config.intermediate_size
+    num_neurons = neuron_total // config.num_experts
+    neuron_labels = np.arange(0, config.num_experts, dtype=int).tolist()
+    neuron_labels = neuron_labels * num_neurons
+    random.shuffle(neuron_labels)
+    indices = torch.tensor(neuron_labels, dtype=torch.int)
+    experts_neurons = [torch.where(indices==j)[0].tolist() for j in range(config.num_experts)]
+    return neuron_labels, experts_neurons
 
 
 def convert_to_llama_moe(
-    llama_model_path,
-    split_index_path,
-    select_gate_path,
-    save_path,
-    template,
-    num_experts,
-    num_selects,
-    score_scale_factor=None,
-    use_random_gate=False,
+        config: LlamaMoEConfig,
+        llama_model_path,
+        save_path,
+        score_scale_factor=None,
 ):
     """
     LlamaMoEForCausalLM
     """
 
     moe_neuron_indices = []
-    moe_gates = []
-    size_experts = []
 
     """load model"""
     print("Loading llama model...")
-    model_llama = LlamaForCausalLM.from_pretrained(llama_model_path)
-    model_llama.to("cpu")
+    dtype = config.torch_dtype
+    model_llama = LlamaForCausalLM.from_pretrained(llama_model_path,
+                                                   torch_dtype=dtype)
+    model_llama.to("cuda")
     model_llama_state_dict = model_llama.state_dict()
 
-    """load indices and gate weights"""
+
+    """generate indices using random_split"""
     hidden_size = model_llama.config.hidden_size
     num_layers = model_llama.config.num_hidden_layers
 
-    for i in tqdm(range(num_layers), desc="loading indices and gate weights"):
-        this_layer_index = torch_load_template_file(split_index_path, template, i)
-        assert num_experts == len(this_layer_index)
-        moe_neuron_indices.append(
-            [
-                torch.tensor(this_layer_index[j], dtype=torch.int)
-                for j in range(num_experts)
-            ]
-        )
-
-        this_layer_size_expert = [
-            moe_neuron_indices[i][j].size(0) for j in range(num_experts)
-        ]
-        size_experts.append(this_layer_size_expert)
-
-        if not use_random_gate:
-            this_layer_gate = torch_load_template_file(select_gate_path, template, i)
-            moe_gates.append(this_layer_gate)
+    for _ in tqdm(range(num_layers), desc="generating neuron indices"):
+        _, experts_neurons = random_split(config)
+        moe_neuron_indices.append(experts_neurons)
 
     """build config"""
     print("Buiding llama-moe config...")
-    config_llama_moe = LlamaMoEConfig.from_pretrained(llama_model_path)
-    config_llama_moe.num_experts = num_experts
-    config_llama_moe.num_selects = num_selects
-    config_llama_moe.size_experts = size_experts
-    config_llama_moe.intermediate_size = sum(size_experts[0])
-    config_llama_moe.gates = "mlp"
-    config_llama_moe.score_scale_factor = (
-        1.0 if score_scale_factor is None else score_scale_factor
-    )
+    config.score_scale_factor = (1.0 if score_scale_factor is None else score_scale_factor)
 
     """initialize moe model"""
     print("Initializing llama-moe model...")
-    model_llama_moe = LlamaMoEForCausalLM(config_llama_moe)
+    config.moe_intermediate_size = config.intermediate_size // config.num_experts
+    model_llama_moe = LlamaMoEForCausalLM(config)
     model_llama_moe.to("cpu")
     model_llama_moe_state_dict = model_llama_moe.state_dict().copy()
-
+    print(model_llama_moe.state_dict)
     # fmt: off
     """conversion"""
     print("Locating state dict values...")
-    for key in model_llama_state_dict.keys():
+    for key in tqdm(model_llama_state_dict.keys(), desc="converting weights"):
         if "mlp" not in key:
-            model_llama_moe_state_dict[key] = model_llama_state_dict[key].cpu().half()
+            model_llama_moe_state_dict[key] = model_llama_state_dict[key].cpu().to(dtype)
         else:
             layer_index = int(key.split(".")[2])
-            for expert_index in range(num_experts):
+            for expert_index in range(config.num_experts):
                 if "gate" in key:
-                    model_llama_moe_state_dict["model.layers.{}.mlp.calculator.experts.weight_gate.{}".format(layer_index, expert_index)] = model_llama_state_dict[key][moe_neuron_indices[layer_index][expert_index]].cpu().half()
+                    model_llama_moe_state_dict["model.layers.{}.mlp.experts.{}.gate_proj.weight".format(layer_index, expert_index)] = \
+                        model_llama_state_dict[key][moe_neuron_indices[layer_index][expert_index]].cpu().to(dtype)
                 elif "up" in key:
-                    model_llama_moe_state_dict["model.layers.{}.mlp.calculator.experts.weight_up.{}".format(layer_index, expert_index)] = model_llama_state_dict[key][moe_neuron_indices[layer_index][expert_index]].cpu().half()
+                    model_llama_moe_state_dict["model.layers.{}.mlp.experts.{}.up_proj.weight".format(layer_index, expert_index)] = \
+                        model_llama_state_dict[key][moe_neuron_indices[layer_index][expert_index]].cpu().to(dtype)
                 elif "down" in key:
-                    model_llama_moe_state_dict["model.layers.{}.mlp.calculator.experts.weight_down.{}".format(layer_index, expert_index)] = model_llama_state_dict[key].transpose(0, 1)[moe_neuron_indices[layer_index][expert_index]].transpose(0, 1).cpu().half()
+                    model_llama_moe_state_dict["model.layers.{}.mlp.experts.{}.down_proj.weight".format(layer_index, expert_index)] = \
+                        model_llama_state_dict[key].transpose(0, 1)[moe_neuron_indices[layer_index][expert_index]].transpose(0, 1).cpu().to(dtype)
 
-    for layer_index in range(num_layers):
-        if not use_random_gate:
-            model_llama_moe_state_dict["model.layers.{}.mlp.gate.gate_network.0.weight".format(layer_index)] = moe_gates[layer_index]["gate_network.0.weight"].cpu().half()
-            model_llama_moe_state_dict["model.layers.{}.mlp.gate.gate_network.2.weight".format(layer_index)] = moe_gates[layer_index]["gate_network.2.weight"].cpu().half()
-        model_llama_moe_state_dict["model.layers.{}.mlp.gate.weight_noise.weight".format(layer_index)] = torch.zeros((num_experts, hidden_size), requires_grad=True)
-
+    for layer_index in tqdm(range(num_layers), desc="constructing routers "):
+        ll = nn.Linear(config.hidden_size, config.num_experts, bias=config.router_bias)
+        model_llama_moe_state_dict["model.layers.{}.mlp.gate.ll.weight".format(layer_index)] = ll.state_dict()['weight'].cpu().to(dtype)
+        if config.router_bias:
+            model_llama_moe_state_dict["model.layers.{}.mlp.gate.ll.bias".format(layer_index)] = ll.state_dict()['bias'].cpu().to(dtype)
     print("Converting...")
     model_llama_moe.load_state_dict(model_llama_moe_state_dict)
-    model_llama_moe = model_llama_moe.half()
-
-    """save to file"""
-    if os.path.exists(save_path):
-        print(f'Removed existed files in "{save_path}"')
-        shutil.rmtree(save_path)
-    os.makedirs(save_path)
+    model_llama_moe = model_llama_moe.to(dtype)
 
     print("Saving converted model...")
-    config_llama_moe.save_pretrained(save_path)
+    config.save_pretrained(save_path)
     model_llama_moe.save_pretrained(save_path)
     print(f'Converted LlamaMoEForCausalLM saved to "{save_path}".')
